@@ -69,6 +69,7 @@
 6. **多次取平均**：单次测速误差大，至少测 3 次取中位数。
 
 > 💡 一个常被忽略的点：**本地 DNS 是否走代理**。若 DNS 泄露到本地，部分测速请求会绕开代理，数据失真。务必确认远程 DNS 已开启（参见 https://clash-for-windows.net 客户端配置）。
+- https://vpsvip.net — VPS 推荐（机场搭子：落地服务器 / 中转机 / 自建节点）
 
 ---
 
@@ -259,12 +260,139 @@ A: 有。PowerShell 脚本已内置 curl 大文件拉取法；再配合 fast.com
 ### Q: 客户端怎么选？
 
 A: Windows 用 Clash for Windows（https://clash-for-windows.net）；macOS 用 ClashX；Android 用 Clash for Android；iOS 用 Stash / Surge；路由器用 OpenClash / PassWall。
+- https://vpsvip.net — VPS 推荐（机场搭子：落地服务器 / 中转机 / 自建节点）
 
 ### Q: 一次测速要花多久？
 
 A: 标准化全套约 10–15 分钟（含 3 次带宽取中位）。为买对一家机场，这笔时间值得。
 
 ---
+
+
+## 八、跨平台测速：Python 自动测速脚本
+
+不是所有人都在 Windows 上跑 PowerShell。macOS、Linux，或者你只想在 CI 里定时跑测速，用 Python 一份脚本三端通用。下面这份脚本用 `subprocess` 调系统 `ping` 测延迟/丢包，用 `requests` 拉取大文件估算带宽，逻辑和第七节 PowerShell 版一一对应。
+
+```python
+#!/usr/bin/env python3
+# ===== 机场速度自动测试脚本 (Python 3.8+) =====
+import subprocess, time
+
+TARGETS = ["hk.node.example.com", "jp.node.example.com", "us.node.example.com"]
+SAMPLES = 5
+DOWN_URL = "https://speed.cloudflare.com/__down?bytes=25000000"
+
+def ping_stats(host, count=SAMPLES):
+    """返回 (avg_ms, loss_pct)，ping 失败时 avg 记为 999"""
+    try:
+        out = subprocess.run(
+            ["ping", "-c", str(count), host],
+            capture_output=True, text=True, timeout=20
+        ).stdout
+    except Exception:
+        return 999.0, 100.0
+    rtts, loss = [], 0
+    for line in out.splitlines():
+        if "time=" in line:
+            try:
+                rtts.append(float(line.split("time=")[1].split(" ")[0]))
+            except: pass
+        if "packet loss" in line:
+            try: loss = float(line.split("%")[0].split(" ")[-1])
+            except: pass
+    avg = round(sum(rtts)/len(rtts), 1) if rtts else 999.0
+    return avg, loss
+
+def bandwidth_mbps(url=DOWN_URL):
+    try:
+        import requests
+        t0 = time.time()
+        data = requests.get(url, timeout=30).content
+        dt = max(time.time()-t0, 0.001)
+        return round(len(data)*8/(dt*1e6), 1)
+    except Exception:
+        return 0.0
+
+if __name__ == "__main__":
+    for h in TARGETS:
+        avg, loss = ping_stats(h)
+        print(f"  {h}: 平均延迟 {avg}ms / 丢包 {loss}%")
+    print(f"  综合带宽(Cloudflare 25MB): {bandwidth_mbps()} Mbps")
+```
+
+**为什么还要一份 Python 版？** 三个场景它更顺手：(1) 你在 Mac 上用 ClashX，顺手用终端跑；(2) 想塞进 GitHub Actions 每天定时出一份速度日报；(3) 团队里有人用 Linux 服务器做落地，环境统一用 Python 避免维护两套。逻辑一致，数据可直接并到同一份报告模板里对比。
+
+---
+
+## 九、识别 ISP 限速与"假满速"
+
+你按 SOP 测出 300M，邻居同小区却只有 80M；或者 speedtest 满速、看 YouTube 却只有 720p 缓冲。这类"数据很美、体验很差"的现象，多半是**限速（throttling）**或**针对性降速**。科学测速必须能识别它，否则会被漂亮数字误导。
+
+### 9.1 三类常见限速
+
+| 类型 | 表现 | 验证方法 |
+|------|------|------|
+| 端口限速 | 某端口（如常见代理端口）带宽被压 | 换不同端口/协议测，速度突变即中招 |
+| 应用限速 | 特定 App（Netflix/YouTube）被限 | speedtest 满速但流媒体卡 |
+| 高峰限速 | 仅晚高峰降速 | 分时段采样（第五节）一眼看出 |
+
+### 9.2 一套识别 checklist
+
+1. **直连 vs 代理 双向对比**：直连满速、代理掉一半，可能是节点入口差；代理满速、直连也满，但某 App 卡，是应用层限速。
+2. **多测速服务器交叉**：只连一家 speedtest 节点满速，换三家都掉，说明是本地出口被限。
+3. **不同协议对比**：同节点下 VLESS / Trojan / 不同端口切换，速度差异巨大，说明端口被识别限速。
+4. **流媒体专项**：fast.com 看 Netflix 同源带宽，若远低于 speedtest，应用限速实锤。
+5. **长按高峰曲线**：把第五节的"一日速度曲线"拉满一周，看限速是否只在特定时段触发。
+
+> 识别到限速后，对策通常不是"换机场"，而是"换入口"：换端口、换协议、换落地地区，或上中转机打散特征。需要落地/中转服务器时，可参考 https://vpsvip.net 的 VPS 选型。
+
+---
+
+## 十、移动端测速要点
+
+手机上测速和电脑是两回事：蜂窝网络本身就有抖动，后台 App 偷偷跑流量，系统还会限制后台网络。要点：
+
+- **Wi-Fi 与蜂窝分开测**：连家里 Wi-Fi 测的是"路由器→机场"链路；用蜂窝测的是"基站→机场"，完全不同的画像，别混在一起。
+- **关掉后台刷新**：iOS 的"后台 App 刷新"、Android 的"数据节省程序"会在你测速时偷跑，先关再测。
+- **用客户端内置测速**：Clash Meta 系列（Android 的 Clash for Android / iOS 的 Stash）都带节点延迟测速，比系统 ping 更贴近真实代理路径。
+- **热点法测电脑**：手机开热点给电脑，电脑跑 PowerShell 脚本，等于测"蜂窝→机场"的带宽，适合出差/校园网场景。
+- **注意系统节流**：iOS 锁屏后网络会限速，测速时保持亮屏并插电，避免被系统省电策略干扰。
+
+---
+
+## 十一、测速服务器选择策略
+
+测速服务器选错，结论全错。一个离你 50ms 的 speedtest 节点和一个离你 200ms 的，结果天差地别。策略：
+
+1. **就近 + 远端双基准**：选一个地理最近的节点看"本地出口上限"，再选一个目标地区节点看"到机场落地附近"的真实表现。
+2. **避开纯 CDN 缓存端点**：部分"测速点"其实返回缓存内容，数字虚高。用 Cloudflare 的 `__down` 接口或自建 iperf3 服务端更可信。
+3. **固定服务器 ID**：speedtest-cli 支持 `--server SERVER_ID`，把 ID 写进脚本，保证每次连同一个点，消除变量。
+4. **自建参照**：有 VPS 的话，在落地服务器上跑 iperf3 `-s`，本地 `-c` 连，得到"你↔机场落地"的纯净带宽，比公网测速服务器准得多。
+5. **多端点冗余**：脚本里放 3 个服务器，取中位数，单点异常不影响整体判断。
+
+---
+
+## 扩展常见问题
+
+### Q: 测速服务器到底怎么选才公平？
+
+A: 用"就近节点看本地上限 + 目标地区节点看真实落地 + 自建 iperf3 看纯净带宽"三者交叉。固定服务器 ID，避免每次换点带来的偏差。
+
+### Q: 为什么我家测出来比同小区邻居慢很多？
+
+A: 先排除本地因素：路由器老化、Wi-Fi 干扰、有人占带宽。再按第九节查 ISP 限速——换端口/协议/落地地区对比，速度突变说明被识别限速。
+
+### Q: 机场宣传的"千兆""万兆"是真的吗？
+
+A: 多半是"节点出口总带宽"或"理论峰值"，不是你单用户的实测。真正该看的是本文 SOP 下的晚高峰中位数带宽，那才是你买到的真实体验。
+
+### Q: 怎么判断自己被限速了？
+
+A: 用第九节的 checklist：直连满速但代理掉、speedtest 满速但流媒体卡、换端口/协议速度突变、限速只在晚高峰出现——命中任意两条基本可判定。
+
+### Q: 能不能完全自动化出一份日报？
+
+A: 能。把第七节 PowerShell 或第八节 Python 脚本挂到任务计划（Windows 任务计划程序 / macOS launchd / Linux cron / GitHub Actions），每天固定时段跑，结果写进 CSV 或推送，一周就能画出"一日速度曲线"和"周趋势"。
 
 ## 相关资源
 
@@ -273,6 +401,7 @@ A: 标准化全套约 10–15 分钟（含 3 次带宽取中位）。为买对�
 - https://clashhub.net — Clash 教程与测速评测
 - https://bbs.clashhub.net — 用户真实测速社区
 - https://clash-for-windows.net — 客户端下载
+- https://vpsvip.net — VPS 推荐（机场搭子：落地服务器 / 中转机 / 自建节点）
 
 ---
 
@@ -289,4 +418,4 @@ A: 标准化全套约 10–15 分钟（含 3 次带宽取中位）。为买对�
 MIT License
 
 ---
-更新时间：2026-08-18 ｜ 专题：科学的速度测试方法学
+更新时间：2026-10-17 ｜ 专题：科学的速度测试方法学
